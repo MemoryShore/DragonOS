@@ -6,6 +6,7 @@ use core::{
     ops::Add,
     sync::atomic::{compiler_fence, Ordering},
 };
+use num_traits::FromPrimitive;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
 
@@ -79,12 +80,12 @@ impl PageManager {
     }
 
     pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        page_reclaimer_lock_irqsave().get(paddr);
+        page_reclaimer_lock_irqsave().get_from_lru(paddr);
         self.phys2page.get(paddr).cloned()
     }
 
     pub fn get_unwrap(&mut self, paddr: &PhysAddr) -> Arc<Page> {
-        page_reclaimer_lock_irqsave().get(paddr);
+        page_reclaimer_lock_irqsave().get_from_lru(paddr);
         self.phys2page
             .get(paddr)
             .unwrap_or_else(|| panic!("Phys Page not found, {:?}", paddr))
@@ -144,7 +145,10 @@ fn page_reclaim_thread() -> i32 {
         // 保留4096个页面，总计16MB的空闲空间
         if usage.free().data() < 4096 {
             let page_to_free = 4096;
-            page_reclaimer_lock_irqsave().shrink_list(PageFrameCount::new(page_to_free));
+            page_reclaimer_lock_irqsave()
+                .shrink_list(PageFrameCount::new(page_to_free), LruList::ActiveFile);
+            page_reclaimer_lock_irqsave()
+                .shrink_list(PageFrameCount::new(page_to_free), LruList::InactiveFile);
         } else {
             //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
             page_reclaimer_lock_irqsave().flush_dirty_pages();
@@ -160,35 +164,73 @@ pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
     unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
 }
 
+#[allow(dead_code)]
+#[derive(Debug, FromPrimitive, Eq, PartialEq, Clone, Copy)]
+#[repr(usize)]
+pub enum LruList {
+    InactiveAnon,
+    ActiveAnon,
+    InactiveFile,
+    ActiveFile,
+    Unevictable,
+    LruNum,
+}
+
 /// 页面回收器
 pub struct PageReclaimer {
-    lru: LruCache<PhysAddr, Arc<Page>>,
+    lru_lists: [LruCache<PhysAddr, Arc<Page>>; LruList::LruNum as usize],
 }
 
 impl PageReclaimer {
     pub fn new() -> Self {
         Self {
-            lru: LruCache::unbounded(),
+            lru_lists: core::array::from_fn(|_| LruCache::unbounded()),
         }
     }
 
-    pub fn get(&mut self, paddr: &PhysAddr) -> Option<Arc<Page>> {
-        self.lru.get(paddr).cloned()
+    pub fn get_from_lru(&mut self, paddr: &PhysAddr) -> Option<(LruList, Arc<Page>)> {
+        for index in 0..LruList::LruNum as usize {
+            if let Some(page) = self.lru_lists[index].peek(paddr) {
+                return Some((FromPrimitive::from_usize(index)?, page.clone()));
+            }
+        }
+        return None;
     }
 
     pub fn insert_page(&mut self, paddr: PhysAddr, page: &Arc<Page>) {
-        self.lru.put(paddr, page.clone());
+        if self.get_from_lru(&paddr).is_some() {
+            return;
+        }
+
+        let index = if page.read_irqsave().is_anon() {
+            LruList::InactiveAnon as usize
+        } else {
+            LruList::InactiveFile as usize
+        };
+        self.lru_lists[index].put(paddr, page.clone());
+    }
+
+    pub fn access_page(&mut self, paddr: PhysAddr) {
+        if let Some((lru, page)) = self.get_from_lru(&paddr) {
+            if lru == LruList::InactiveAnon || lru == LruList::InactiveFile {
+                self.lru_lists[lru as usize].pop(&paddr);
+                self.lru_lists[lru as usize + 2].put(paddr, page);
+            } else {
+                self.lru_lists[lru as usize].get(&paddr);
+            }
+        }
     }
 
     /// lru链表缩减
     /// ## 参数
     ///
     /// - `count`: 需要缩减的页面数量
-    pub fn shrink_list(&mut self, count: PageFrameCount) {
+    fn shrink_list(&mut self, count: PageFrameCount, list: LruList) {
+        let index = list as usize;
         for _ in 0..count.data() {
-            let (paddr, page) = self.lru.pop_lru().expect("pagecache is empty");
+            let (paddr, page) = self.lru_lists[index].pop_lru().expect("pagecache is empty");
             let page_cache = page.read_irqsave().page_cache().unwrap();
-            for vma in page.read_irqsave().anon_vma() {
+            for vma in page.read_irqsave().rmap_vma() {
                 let address_space = vma.lock_irqsave().address_space().unwrap();
                 let address_space = address_space.upgrade().unwrap();
                 let mut guard = address_space.write();
@@ -225,7 +267,7 @@ impl PageReclaimer {
             page.write_irqsave().remove_flags(PageFlags::PG_DIRTY);
         }
 
-        for vma in page.read_irqsave().anon_vma() {
+        for vma in page.read_irqsave().rmap_vma() {
             let address_space = vma.lock_irqsave().address_space().unwrap();
             let address_space = address_space.upgrade().unwrap();
             let mut guard = address_space.write();
@@ -275,10 +317,12 @@ impl PageReclaimer {
     /// lru脏页刷新
     pub fn flush_dirty_pages(&self) {
         // log::info!("flush_dirty_pages");
-        let iter = self.lru.iter();
-        for (_, page) in iter {
-            if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
-                Self::page_writeback(page, false);
+        for list in [LruList::InactiveFile, LruList::ActiveFile] {
+            let iter = self.lru_lists[list as usize].iter();
+            for (_, page) in iter {
+                if page.read_irqsave().flags().contains(PageFlags::PG_DIRTY) {
+                    Self::page_writeback(page, false);
+                }
             }
         }
     }
@@ -339,7 +383,7 @@ pub struct InnerPage {
     /// 共享页id（如果是共享页）
     shm_id: Option<ShmId>,
     /// 映射到当前page的VMA
-    anon_vma: HashSet<Arc<LockedVMA>>,
+    rmap_vma: HashSet<Arc<LockedVMA>>,
     /// 标志
     flags: PageFlags,
     /// 页所在的物理页帧号
@@ -357,7 +401,7 @@ impl InnerPage {
             shared,
             free_when_zero: dealloc_when_zero,
             shm_id: None,
-            anon_vma: HashSet::new(),
+            rmap_vma: HashSet::new(),
             flags: PageFlags::empty(),
             phys_addr,
             index: None,
@@ -367,13 +411,13 @@ impl InnerPage {
 
     /// 将vma加入anon_vma
     pub fn insert_vma(&mut self, vma: Arc<LockedVMA>) {
-        self.anon_vma.insert(vma);
+        self.rmap_vma.insert(vma);
         self.map_count += 1;
     }
 
     /// 将vma从anon_vma中删去
     pub fn remove_vma(&mut self, vma: &LockedVMA) {
-        self.anon_vma.remove(vma);
+        self.rmap_vma.remove(vma);
         self.map_count -= 1;
     }
 
@@ -424,8 +468,8 @@ impl InnerPage {
     }
 
     #[inline(always)]
-    pub fn anon_vma(&self) -> &HashSet<Arc<LockedVMA>> {
-        &self.anon_vma
+    pub fn rmap_vma(&self) -> &HashSet<Arc<LockedVMA>> {
+        &self.rmap_vma
     }
 
     #[inline(always)]
@@ -456,6 +500,12 @@ impl InnerPage {
     #[inline(always)]
     pub fn phys_address(&self) -> PhysAddr {
         self.phys_addr
+    }
+
+    #[inline(always)]
+    pub fn is_anon(&self) -> bool {
+        // TODO 暂时通过是否有page_cache判断匿名页，但感觉不太严谨，后续可能需要完善
+        self.page_cache.is_none()
     }
 }
 
