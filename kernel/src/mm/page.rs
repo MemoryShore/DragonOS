@@ -287,7 +287,8 @@ impl PageReclaimer {
                 };
             }
         }
-        let inode = page
+
+        let inode = match page
             .read_irqsave()
             .page_cache
             .clone()
@@ -296,7 +297,12 @@ impl PageReclaimer {
             .clone()
             .unwrap()
             .upgrade()
-            .unwrap();
+        {
+            Some(inode) => inode,
+            // inode不存在说明已经被删除，不用执行后续操作
+            None => return,
+        };
+
         inode
             .write_at(
                 page.read_irqsave().index().unwrap(),
