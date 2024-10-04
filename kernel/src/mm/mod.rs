@@ -79,6 +79,7 @@ bitflags! {
 
     /// 描述页面错误处理过程中发生的不同情况或结果
         pub struct VmFaultReason:u32 {
+        const VM_FAULT_EMPTY = 0x000000;
         const VM_FAULT_OOM = 0x000001;
         const VM_FAULT_SIGBUS = 0x000002;
         const VM_FAULT_MAJOR = 0x000004;

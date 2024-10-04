@@ -10,6 +10,7 @@ use crate::{
     arch::{interrupt::TrapFrame, process::arch_switch_to_user},
     driver::{net::e1000e::e1000e::e1000e_init, virtio::virtio::virtio_probe},
     filesystem::vfs::core::mount_root_fs,
+    mm::page::swap_manager_init,
     net::net_core::net_init,
     process::{kthread::KernelThreadMechanism, stdio::stdio_init, ProcessFlags, ProcessManager},
     smp::smp_init,
@@ -39,6 +40,7 @@ fn kernel_init() -> Result<(), SystemError> {
         .ok();
     virtio_probe();
     mount_root_fs().expect("Failed to mount root fs");
+    swap_manager_init();
     e1000e_init();
     net_init().unwrap_or_else(|err| {
         error!("Failed to initialize network: {:?}", err);

@@ -6,6 +6,7 @@ use core::{
     ops::Add,
     sync::atomic::{compiler_fence, Ordering},
 };
+use kdepends::xarray::XArray;
 use num_traits::FromPrimitive;
 use system_error::SystemError;
 use unified_init::macros::unified_init;
@@ -18,7 +19,7 @@ use lru::LruCache;
 use crate::{
     arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
     exception::ipi::{IpiKind, IpiTarget},
-    filesystem::vfs::{file::PageCache, FilePrivateData},
+    filesystem::vfs::{file::PageCache, FilePrivateData, IndexNode},
     init::initcall::INITCALL_CORE,
     ipc::shm::ShmId,
     libs::{
@@ -145,9 +146,9 @@ fn page_reclaim_thread() -> i32 {
         // 保留4096个页面，总计16MB的空闲空间
         if usage.free().data() < 4096 {
             let page_to_free = 4096;
-            page_reclaimer_lock_irqsave()
+            let _ = page_reclaimer_lock_irqsave()
                 .shrink_list(PageFrameCount::new(page_to_free), LruList::ActiveFile);
-            page_reclaimer_lock_irqsave()
+            let _ = page_reclaimer_lock_irqsave()
                 .shrink_list(PageFrameCount::new(page_to_free), LruList::InactiveFile);
         } else {
             //TODO 暂时让页面回收线程负责脏页回写任务，后续需要分离
@@ -162,6 +163,114 @@ fn page_reclaim_thread() -> i32 {
 /// 获取页面回收器
 pub fn page_reclaimer_lock_irqsave() -> SpinLockGuard<'static, PageReclaimer> {
     unsafe { PAGE_RECLAIMER.as_ref().unwrap().lock_irqsave() }
+}
+
+static mut SWAP_FILE_INODE: Option<Arc<dyn IndexNode>> = None;
+
+/// swap文件初始化函数
+/// TODO 后续实现swap分区
+pub fn swap_file_init() -> Result<(), SystemError> {
+    let parent_inode: Arc<dyn IndexNode> = crate::filesystem::vfs::ROOT_INODE().lookup("/")?;
+    // 创建文件
+    let inode: Arc<dyn IndexNode> = parent_inode.create(
+        "swap",
+        crate::filesystem::vfs::FileType::File,
+        crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o000),
+    )?;
+
+    inode.resize(4096 * MMArch::PAGE_SIZE)?;
+    inode.write_at(
+        0,
+        4096 * MMArch::PAGE_SIZE,
+        &[0_u8; 4096 * MMArch::PAGE_SIZE],
+        SpinLock::new(FilePrivateData::Unused).lock(),
+    )?;
+
+    unsafe {
+        SWAP_FILE_INODE = Some(inode);
+    }
+    Ok(())
+}
+
+const SWAP_PAGE_NUM: usize = 4096;
+
+pub struct SwapManager {
+    swap_map: [usize; SWAP_PAGE_NUM],
+    swap_cache: XArray<Arc<Page>>,
+}
+
+static mut SWAP_MANAGER: Option<SpinLock<SwapManager>> = None;
+
+/// 获取页面置换管理器
+pub fn swap_manager_lock_irqsave() -> SpinLockGuard<'static, SwapManager> {
+    unsafe { SWAP_MANAGER.as_ref().unwrap().lock_irqsave() }
+}
+
+impl SwapManager {
+    pub fn new() -> Self {
+        SwapManager {
+            swap_map: [0; SWAP_PAGE_NUM],
+            swap_cache: XArray::new(),
+        }
+    }
+
+    pub fn swap_anon_page(&mut self, paddr: PhysAddr) -> Result<usize, SystemError> {
+        let mut find_free: Option<usize> = None;
+        for i in 0..SWAP_PAGE_NUM {
+            if self.swap_map[i] == 0 {
+                find_free = Some(i);
+                break;
+            }
+        }
+
+        if let Some(index) = find_free {
+            unsafe {
+                SWAP_FILE_INODE.clone().unwrap().write_at(
+                    index * MMArch::PAGE_SIZE,
+                    MMArch::PAGE_SIZE,
+                    core::slice::from_raw_parts(paddr.data() as *const u8, MMArch::PAGE_SIZE),
+                    SpinLock::new(FilePrivateData::Unused).lock(),
+                )?;
+            }
+            return Ok(index);
+        }
+        return Err(SystemError::ENOMEM);
+    }
+
+    pub fn insert_swap_cache(&mut self, index: usize, page: Arc<Page>) {
+        self.swap_cache.store(index as u64, page);
+    }
+
+    pub fn get_from_swap_cache(&self, index: usize) -> Option<Arc<Page>> {
+        self.swap_cache.load(index as u64).map(|r| (*r).clone())
+    }
+
+    pub fn decrement_ref(&mut self, index: usize) -> Result<usize, SystemError> {
+        if self.swap_map[index] > 0 {
+            self.swap_map[index] -= 1;
+
+            if self.swap_map[index] == 0 {
+                let _ = self.swap_cache.remove(index as u64);
+            }
+
+            return Ok(self.swap_map[index]);
+        } else {
+            return Err(SystemError::EINVAL);
+        }
+    }
+}
+
+pub fn swap_manager_init() {
+    swap_file_init().expect("Failed to initialize page swap manager");
+
+    info!("page_reclaimer_init");
+    let swap_manager = SpinLock::new(SwapManager::new());
+
+    compiler_fence(Ordering::SeqCst);
+    unsafe { SWAP_MANAGER = Some(swap_manager) };
+    compiler_fence(Ordering::SeqCst);
+
+    info!("page_reclaimer_init done");
 }
 
 #[allow(dead_code)]
@@ -225,27 +334,51 @@ impl PageReclaimer {
     /// ## 参数
     ///
     /// - `count`: 需要缩减的页面数量
-    fn shrink_list(&mut self, count: PageFrameCount, list: LruList) {
+    fn shrink_list(&mut self, count: PageFrameCount, list: LruList) -> Result<(), SystemError> {
         let index = list as usize;
         for _ in 0..count.data() {
             let (paddr, page) = self.lru_lists[index].pop_lru().expect("pagecache is empty");
-            let page_cache = page.read_irqsave().page_cache().unwrap();
+
+            match list {
+                LruList::InactiveFile | LruList::ActiveFile => {
+                    let page_cache = page.read_irqsave().page_cache().unwrap();
+                    page_cache.remove_page(page.read_irqsave().index().unwrap());
+                    if page.read_irqsave().flags.contains(PageFlags::PG_DIRTY) {
+                        Self::page_writeback(&page, true);
+                    }
+                }
+                _ => {}
+            };
+
             for vma in page.read_irqsave().rmap_vma() {
                 let address_space = vma.lock_irqsave().address_space().unwrap();
                 let address_space = address_space.upgrade().unwrap();
                 let mut guard = address_space.write();
                 let mapper = &mut guard.user_mapper.utable;
                 let virt = vma.lock_irqsave().page_address(&page).unwrap();
+
                 unsafe {
-                    mapper.unmap(virt, false).unwrap().flush();
+                    // 设置标志位
+                    let pte_table = mapper.get_table(virt, 0).unwrap();
+                    let i = pte_table.index_of(virt).unwrap();
+                    let flags = pte_table.entry(i).unwrap().flags().set_present(false);
+                    let new_entry = match list {
+                        LruList::InactiveAnon | LruList::ActiveAnon => {
+                            let i = swap_manager_lock_irqsave().swap_anon_page(paddr)?;
+                            PageEntry::new(PhysAddr(i * MMArch::PAGE_SIZE), flags)
+                        }
+
+                        LruList::InactiveFile | LruList::ActiveFile => PageEntry::from_usize(0),
+                        _ => return Err(SystemError::EINVAL),
+                    };
+                    pte_table.set_entry(i, new_entry);
                 }
             }
-            page_cache.remove_page(page.read_irqsave().index().unwrap());
+
             page_manager_lock_irqsave().remove_page(&paddr);
-            if page.read_irqsave().flags.contains(PageFlags::PG_DIRTY) {
-                Self::page_writeback(&page, true);
-            }
         }
+
+        Ok(())
     }
 
     /// 唤醒页面回收线程
@@ -955,6 +1088,13 @@ impl<Arch: MemoryManagementArch> EntryFlags<Arch> {
     #[inline(always)]
     pub fn present(&self) -> bool {
         return self.has_flag(Arch::ENTRY_FLAG_PRESENT);
+    }
+
+    /// 设置当前页表项是否可用
+    #[must_use]
+    #[inline(always)]
+    pub fn set_present(self, value: bool) -> Self {
+        return self.update_flags(Arch::ENTRY_FLAG_PRESENT, value);
     }
 
     /// 设置当前页表项的权限

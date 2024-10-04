@@ -11,7 +11,7 @@ use crate::{
     arch::{mm::PageMapper, MMArch},
     libs::align::align_down,
     mm::{
-        page::{page_manager_lock_irqsave, EntryFlags},
+        page::{page_manager_lock_irqsave, swap_manager_lock_irqsave, EntryFlags},
         ucontext::LockedVMA,
         VirtAddr, VmFaultReason, VmFlags,
     },
@@ -393,14 +393,29 @@ impl PageFaultHandler {
     /// - VmFaultReason: 页面错误处理信息标志
     #[allow(unused_variables)]
     pub unsafe fn do_swap_page(pfm: &mut PageFaultMessage) -> VmFaultReason {
-        panic!(
-            "do_swap_page has not yet been implemented, 
-        fault message: {:?}, 
-        pid: {}\n",
-            pfm,
-            crate::process::ProcessManager::current_pid().data()
-        );
-        // TODO https://code.dragonos.org.cn/xref/linux-6.6.21/mm/memory.c#do_swap_page
+        let guard = swap_manager_lock_irqsave();
+
+        let vaddr = pfm.address();
+        let flags = pfm.vma().lock_irqsave().flags();
+        let entry = pfm.mapper.get_entry(vaddr, 0).unwrap();
+        let index = entry.address().unwrap_err().data() / MMArch::PAGE_SIZE;
+
+        if let Some(page) = guard.get_from_swap_cache(index) {
+            pfm.mapper
+                .map_phys(vaddr, page.read_irqsave().phys_address(), flags);
+            return VmFaultReason::VM_FAULT_EMPTY;
+        } else {
+            let new_paddr = pfm.mapper.allocator_mut().allocate_one().unwrap();
+            let new_page = Arc::new(Page::new(
+                pfm.vma()
+                    .lock_irqsave()
+                    .vm_flags()
+                    .contains(VmFlags::VM_SHARED),
+                new_paddr,
+            ));
+            page_manager_lock_irqsave().insert(new_paddr, &new_page);
+            return VmFaultReason::VM_FAULT_MAJOR;
+        }
     }
 
     /// 处理NUMA的缺页异常
